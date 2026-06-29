@@ -1,0 +1,9 @@
+CREATE INDEX idx_users_email ON users (email);
+CREATE INDEX idx_student_profiles_user_id ON student_profiles (user_id);
+CREATE INDEX idx_clearance_requests_student_profile_id ON clearance_requests (student_profile_id);
+CREATE INDEX idx_clearance_requests_status ON clearance_requests (status);
+CREATE INDEX idx_clearance_steps_office_id ON clearance_steps (office_id);
+CREATE INDEX idx_clearance_steps_request_id ON clearance_steps (clearance_request_id);
+CREATE INDEX idx_attachments_request_id ON attachments (clearance_request_id);
+CREATE INDEX idx_approval_logs_request_id ON approval_logs (clearance_request_id);
+CREATE INDEX idx_blacklisted_tokens_token ON blacklisted_tokens (token);
