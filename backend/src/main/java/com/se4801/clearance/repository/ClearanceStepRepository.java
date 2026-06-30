@@ -9,15 +9,21 @@ import org.springframework.data.jpa.repository.JpaRepository;
 
 import java.util.List;
 import java.util.Optional;
+import java.util.Collection;
 
 public interface ClearanceStepRepository extends JpaRepository<ClearanceStep, Long> {
-    boolean existsByClearanceRequestIdAndOfficeId(Long clearanceRequestId, Long officeId);
-
     @EntityGraph(attributePaths = {"office", "clearanceRequest", "clearanceRequest.studentProfile", "clearanceRequest.studentProfile.user", "reviewedBy"})
     Page<ClearanceStep> findByOfficeId(Long officeId, Pageable pageable);
 
     @EntityGraph(attributePaths = {"office", "clearanceRequest", "clearanceRequest.studentProfile", "clearanceRequest.studentProfile.user", "reviewedBy"})
     Page<ClearanceStep> findByOfficeIdAndStatus(Long officeId, ClearanceStepStatus status, Pageable pageable);
+
+    @EntityGraph(attributePaths = {"office", "clearanceRequest", "clearanceRequest.studentProfile", "clearanceRequest.studentProfile.user", "reviewedBy"})
+    Page<ClearanceStep> findByOfficeIdAndStatusIn(
+            Long officeId,
+            Collection<ClearanceStepStatus> statuses,
+            Pageable pageable
+    );
 
     @EntityGraph(attributePaths = {"office", "clearanceRequest", "clearanceRequest.studentProfile", "clearanceRequest.studentProfile.user", "reviewedBy"})
     Optional<ClearanceStep> findByIdAndOfficeId(Long id, Long officeId);
