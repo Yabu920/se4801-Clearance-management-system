@@ -8,6 +8,7 @@ import com.se4801.clearance.exception.BusinessRuleException;
 import com.se4801.clearance.exception.ResourceNotFoundException;
 import com.se4801.clearance.mapper.OfficeStepReviewMapper;
 import com.se4801.clearance.model.ApprovalLog;
+import com.se4801.clearance.model.AttachmentPurpose;
 import com.se4801.clearance.model.ClearanceRequest;
 import com.se4801.clearance.model.ClearanceRequestStatus;
 import com.se4801.clearance.model.ClearanceStep;
@@ -24,6 +25,7 @@ import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.multipart.MultipartFile;
 
 import java.time.Instant;
 import java.util.List;
@@ -36,6 +38,7 @@ public class OfficeReviewService {
     private final ClearanceRequestRepository clearanceRequestRepository;
     private final ApprovalLogRepository approvalLogRepository;
     private final UserRepository userRepository;
+    private final AttachmentService attachmentService;
 
     @Transactional(readOnly = true)
     public PageResponse<OfficeStepReviewResponse> getAssignedSteps(
@@ -50,7 +53,7 @@ public class OfficeReviewService {
 
         List<OfficeStepReviewResponse> content = steps.getContent()
                 .stream()
-                .map(OfficeStepReviewMapper::toResponse)
+                .map(step -> toResponse(step))
                 .toList();
 
         return new PageResponse<>(
@@ -67,7 +70,7 @@ public class OfficeReviewService {
     public OfficeStepReviewResponse getAssignedStep(Long stepId, CustomUserPrincipal principal) {
         User staff = getOfficeStaff(principal);
         ClearanceStep step = findAssignedStep(stepId, staff);
-        return OfficeStepReviewMapper.toResponse(step);
+        return toResponse(step);
     }
 
     @Transactional
@@ -76,6 +79,16 @@ public class OfficeReviewService {
             ReviewClearanceStepRequest request,
             CustomUserPrincipal principal
     ) {
+        return reviewStep(stepId, request, principal, null);
+    }
+
+    @Transactional
+    public OfficeStepReviewResponse reviewStep(
+            Long stepId,
+            ReviewClearanceStepRequest request,
+            CustomUserPrincipal principal,
+            MultipartFile attachment
+    ) {
         User staff = getOfficeStaff(principal);
         ClearanceStep step = findAssignedStep(stepId, staff);
 
@@ -83,7 +96,7 @@ public class OfficeReviewService {
 
         ClearanceStepStatus newStatus = request.decision() == ReviewDecision.APPROVED
                 ? ClearanceStepStatus.APPROVED
-                : ClearanceStepStatus.REJECTED;
+                : ClearanceStepStatus.NEEDS_CORRECTION;
 
         step.setStatus(newStatus);
         step.setComment(normalizeComment(request.comment()));
@@ -93,8 +106,15 @@ public class OfficeReviewService {
         ClearanceStep savedStep = clearanceStepRepository.save(step);
         saveApprovalLog(savedStep, staff, request);
         updateParentRequestStatus(savedStep.getClearanceRequest());
+        attachmentService.storeWorkflowFile(
+                savedStep.getClearanceRequest(),
+                savedStep,
+                staff,
+                AttachmentPurpose.OFFICE_REVIEW,
+                attachment
+        );
 
-        return OfficeStepReviewMapper.toResponse(savedStep);
+        return toResponse(savedStep);
     }
 
     private User getOfficeStaff(CustomUserPrincipal principal) {
@@ -124,6 +144,12 @@ public class OfficeReviewService {
         if (step.getStatus() == ClearanceStepStatus.APPROVED || step.getStatus() == ClearanceStepStatus.REJECTED) {
             throw new BusinessRuleException("This clearance step has already been reviewed");
         }
+        if (step.getStatus() == ClearanceStepStatus.NEEDS_CORRECTION) {
+            throw new BusinessRuleException("This clearance step is waiting for student correction");
+        }
+        if (step.getStatus() != ClearanceStepStatus.PENDING && step.getStatus() != ClearanceStepStatus.RESUBMITTED) {
+            throw new BusinessRuleException("Only pending or resubmitted clearance steps can be reviewed");
+        }
         if (request.decision() == ReviewDecision.REJECTED && isBlank(request.comment())) {
             throw new BusinessRuleException("Comment is required when rejecting a clearance step");
         }
@@ -143,10 +169,13 @@ public class OfficeReviewService {
     private void updateParentRequestStatus(ClearanceRequest request) {
         List<ClearanceStep> steps = clearanceStepRepository.findByClearanceRequestIdOrderByOfficeIdAsc(request.getId());
 
-        if (steps.stream().anyMatch(step -> step.getStatus() == ClearanceStepStatus.REJECTED)) {
-            request.setStatus(ClearanceRequestStatus.REJECTED);
-        } else if (steps.stream().filter(step -> !isRegistrarStep(step))
-                .allMatch(step -> step.getStatus() == ClearanceStepStatus.APPROVED)) {
+        List<ClearanceStep> officeSteps = steps.stream()
+                .filter(step -> !isRegistrarStep(step))
+                .toList();
+
+        if (officeSteps.stream().anyMatch(step -> step.getStatus() == ClearanceStepStatus.NEEDS_CORRECTION)) {
+            request.setStatus(ClearanceRequestStatus.NEEDS_CORRECTION);
+        } else if (officeSteps.stream().allMatch(step -> step.getStatus() == ClearanceStepStatus.APPROVED)) {
             request.setStatus(ClearanceRequestStatus.READY_FOR_REGISTRAR);
         } else {
             request.setStatus(ClearanceRequestStatus.IN_REVIEW);
@@ -165,5 +194,12 @@ public class OfficeReviewService {
 
     private boolean isBlank(String value) {
         return value == null || value.isBlank();
+    }
+
+    private OfficeStepReviewResponse toResponse(ClearanceStep step) {
+        return OfficeStepReviewMapper.toResponse(
+                step,
+                attachmentService.getRequestAttachments(step.getClearanceRequest().getId())
+        );
     }
 }

@@ -1,6 +1,7 @@
 package com.se4801.clearance.service;
 
 import com.se4801.clearance.dto.request.CreateClearanceRequest;
+import com.se4801.clearance.dto.request.StudentStepResubmissionRequest;
 import com.se4801.clearance.dto.response.ClearanceRequestResponse;
 import com.se4801.clearance.dto.response.ClearanceStepResponse;
 import com.se4801.clearance.dto.response.PageResponse;
@@ -15,16 +16,22 @@ import com.se4801.clearance.model.ClearanceStepStatus;
 import com.se4801.clearance.model.Office;
 import com.se4801.clearance.model.Role;
 import com.se4801.clearance.model.StudentProfile;
+import com.se4801.clearance.model.ApprovalLog;
+import com.se4801.clearance.model.AttachmentPurpose;
+import com.se4801.clearance.model.User;
+import com.se4801.clearance.repository.ApprovalLogRepository;
 import com.se4801.clearance.repository.ClearanceRequestRepository;
 import com.se4801.clearance.repository.ClearanceStepRepository;
 import com.se4801.clearance.repository.OfficeRepository;
 import com.se4801.clearance.repository.StudentProfileRepository;
+import com.se4801.clearance.repository.UserRepository;
 import com.se4801.clearance.security.CustomUserPrincipal;
 import lombok.RequiredArgsConstructor;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.multipart.MultipartFile;
 
 import java.util.EnumSet;
 import java.util.List;
@@ -37,6 +44,7 @@ public class ClearanceRequestService {
     private static final Set<ClearanceRequestStatus> ACTIVE_STATUSES = EnumSet.of(
             ClearanceRequestStatus.PENDING,
             ClearanceRequestStatus.IN_REVIEW,
+            ClearanceRequestStatus.NEEDS_CORRECTION,
             ClearanceRequestStatus.READY_FOR_REGISTRAR
     );
 
@@ -44,6 +52,9 @@ public class ClearanceRequestService {
     private final ClearanceStepRepository clearanceStepRepository;
     private final StudentProfileRepository studentProfileRepository;
     private final OfficeRepository officeRepository;
+    private final ApprovalLogRepository approvalLogRepository;
+    private final UserRepository userRepository;
+    private final AttachmentService attachmentService;
 
     @Transactional
     public ClearanceRequestResponse createRequest(CreateClearanceRequest request, CustomUserPrincipal principal) {
@@ -114,11 +125,61 @@ public class ClearanceRequestService {
         return toResponse(request);
     }
 
+    @Transactional
+    public ClearanceRequestResponse resubmitStep(
+            Long stepId,
+            StudentStepResubmissionRequest request,
+            CustomUserPrincipal principal
+    ) {
+        return resubmitStep(stepId, request, principal, null);
+    }
+
+    @Transactional
+    public ClearanceRequestResponse resubmitStep(
+            Long stepId,
+            StudentStepResubmissionRequest request,
+            CustomUserPrincipal principal,
+            MultipartFile attachment
+    ) {
+        ensureStudent(principal);
+        ClearanceStep step = clearanceStepRepository.findByIdAndClearanceRequestStudentProfileUserId(
+                        stepId,
+                        principal.getId()
+                )
+                .orElseThrow(() -> new ResourceNotFoundException("Clearance step not found for your request"));
+
+        if (!canStudentResubmit(step)) {
+            throw new BusinessRuleException("Only office steps needing correction can be resubmitted");
+        }
+
+        User student = userRepository.findById(principal.getId())
+                .orElseThrow(() -> new ResourceNotFoundException("Student user not found"));
+
+        step.setStatus(ClearanceStepStatus.RESUBMITTED);
+        step.setComment(normalizeReason(request.correctionNote()));
+        step.setReviewedAt(null);
+        step.setReviewedBy(null);
+        ClearanceStep savedStep = clearanceStepRepository.save(step);
+
+        ClearanceRequest clearanceRequest = savedStep.getClearanceRequest();
+        updateParentStatusAfterResubmission(clearanceRequest);
+        saveResubmissionLog(savedStep, student, request);
+        attachmentService.storeWorkflowFile(
+                clearanceRequest,
+                savedStep,
+                student,
+                AttachmentPurpose.STUDENT_CORRECTION,
+                attachment
+        );
+
+        return toResponse(clearanceRequest);
+    }
+
     private ClearanceRequestResponse toResponse(ClearanceRequest clearanceRequest) {
         List<ClearanceStepResponse> steps = clearanceStepRepository
                 .findByClearanceRequestIdOrderByOfficeIdAsc(clearanceRequest.getId())
                 .stream()
-                .map(ClearanceStepMapper::toResponse)
+                .map(step -> ClearanceStepMapper.toResponse(step, attachmentService.getStepAttachments(step.getId())))
                 .toList();
         return ClearanceRequestMapper.toResponse(clearanceRequest, steps);
     }
@@ -143,5 +204,49 @@ public class ClearanceRequestService {
 
     private String normalizeReason(String reason) {
         return reason == null || reason.isBlank() ? null : reason.trim();
+    }
+
+    private void updateParentStatusAfterResubmission(ClearanceRequest request) {
+        List<ClearanceStep> steps = clearanceStepRepository.findByClearanceRequestIdOrderByOfficeIdAsc(request.getId());
+        boolean hasOtherCorrection = steps.stream()
+                .filter(step -> !isRegistrarStep(step))
+                .anyMatch(step -> step.getStatus() == ClearanceStepStatus.NEEDS_CORRECTION
+                        || step.getStatus() == ClearanceStepStatus.REJECTED);
+
+        request.setStatus(hasOtherCorrection
+                ? ClearanceRequestStatus.NEEDS_CORRECTION
+                : ClearanceRequestStatus.IN_REVIEW);
+        clearanceRequestRepository.save(request);
+    }
+
+    private void saveResubmissionLog(
+            ClearanceStep step,
+            User student,
+            StudentStepResubmissionRequest request
+    ) {
+        ApprovalLog log = ApprovalLog.builder()
+                .action("STUDENT_RESUBMITTED_STEP")
+                .note(normalizeReason(request.correctionNote()))
+                .actor(student)
+                .clearanceRequest(step.getClearanceRequest())
+                .clearanceStep(step)
+                .build();
+        approvalLogRepository.save(log);
+    }
+
+    private boolean isRegistrarStep(ClearanceStep step) {
+        return "Registrar".equalsIgnoreCase(step.getOffice().getOfficeName());
+    }
+
+    private boolean canStudentResubmit(ClearanceStep step) {
+        ClearanceRequest clearanceRequest = step.getClearanceRequest();
+        if (isRegistrarStep(step)
+                || clearanceRequest.getStatus() == ClearanceRequestStatus.COMPLETED
+                || clearanceRequest.getStatus() == ClearanceRequestStatus.CANCELLED) {
+            return false;
+        }
+
+        return step.getStatus() == ClearanceStepStatus.NEEDS_CORRECTION
+                || step.getStatus() == ClearanceStepStatus.REJECTED;
     }
 }

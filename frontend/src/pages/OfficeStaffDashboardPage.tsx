@@ -2,6 +2,7 @@ import { MouseEvent, useEffect, useMemo, useState } from 'react';
 import { PageShell } from '../components/PageShell';
 import { RoleActivityPanel } from '../components/RoleActivityPanel';
 import {
+  downloadAttachment,
   getAssignedOfficeSteps,
   reviewOfficeStep,
   type OfficeStepReviewResponse,
@@ -9,8 +10,10 @@ import {
 
 export function OfficeStaffDashboardPage() {
   const [steps, setSteps] = useState<OfficeStepReviewResponse[]>([]);
-  const [status, setStatus] = useState('PENDING');
+  const [status, setStatus] = useState('');
   const [comments, setComments] = useState<Record<number, string>>({});
+  const [attachments, setAttachments] = useState<Record<number, File | null>>({});
+  const [uploadVersion, setUploadVersion] = useState(0);
   const [loading, setLoading] = useState(true);
   const [reviewingStepId, setReviewingStepId] = useState<number | null>(null);
   const [message, setMessage] = useState('');
@@ -44,9 +47,16 @@ export function OfficeStaffDashboardPage() {
     setReviewingStepId(stepId);
 
     try {
-      const reviewed = await reviewOfficeStep(stepId, decision, comments[stepId] ?? '');
+      const reviewed = await reviewOfficeStep(
+        stepId,
+        decision,
+        comments[stepId] ?? '',
+        attachments[stepId]
+      );
       setMessage(`Step #${reviewed.stepId} marked ${reviewed.status}.`);
       setComments((current) => ({ ...current, [stepId]: '' }));
+      setAttachments((current) => ({ ...current, [stepId]: null }));
+      setUploadVersion((current) => current + 1);
       await loadSteps(status);
     } catch (reviewError) {
       setError(reviewError instanceof Error ? reviewError.message : 'Could not review step');
@@ -88,6 +98,8 @@ export function OfficeStaffDashboardPage() {
             >
               <option value="">All</option>
               <option value="PENDING">Pending</option>
+              <option value="RESUBMITTED">Resubmitted</option>
+              <option value="NEEDS_CORRECTION">Needs correction</option>
               <option value="APPROVED">Approved</option>
               <option value="REJECTED">Rejected</option>
               <option value="WAITING">Waiting</option>
@@ -112,7 +124,10 @@ export function OfficeStaffDashboardPage() {
           {loading ? (
             <p className="px-4 py-6 text-sm text-slate-600">Loading assigned steps...</p>
           ) : steps.length === 0 ? (
-            <p className="px-4 py-6 text-sm text-slate-600">No assigned steps match this filter.</p>
+            <p className="px-4 py-6 text-sm text-slate-600">
+              No assigned steps match this filter. If Finance requests are missing, ask an admin to confirm this
+              account is assigned to the Finance office.
+            </p>
           ) : (
             <div className="divide-y divide-slate-100">
               {steps.map((step) => (
@@ -133,8 +148,27 @@ export function OfficeStaffDashboardPage() {
                   </div>
 
                   {step.comment && <p className="rounded bg-slate-50 px-3 py-2 text-sm text-slate-600">{step.comment}</p>}
+                  {(step.attachments ?? []).length > 0 && (
+                    <div className="rounded border border-slate-200 bg-slate-50 p-3">
+                      <p className="mb-2 text-xs font-semibold text-slate-700">Request attachments</p>
+                      <div className="flex flex-wrap gap-2">
+                        {(step.attachments ?? []).map((attachment) => (
+                          <button
+                            className="text-sm font-medium text-brand-700 hover:underline"
+                            key={attachment.id}
+                            onClick={() => void downloadAttachment(attachment).catch((downloadError) => {
+                              setError(downloadError instanceof Error ? downloadError.message : 'Could not download attachment');
+                            })}
+                            type="button"
+                          >
+                            {formatEnum(attachment.purpose)}: {attachment.fileName}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
 
-                  {step.status === 'PENDING' ? (
+                  {(step.status === 'PENDING' || step.status === 'RESUBMITTED') ? (
                     <form className="space-y-3" onSubmit={(event) => event.preventDefault()}>
                       <textarea
                         className="min-h-20 w-full rounded border border-slate-300 px-3 py-2 text-sm"
@@ -143,6 +177,19 @@ export function OfficeStaffDashboardPage() {
                         placeholder="Comment for this decision"
                         value={comments[step.stepId] ?? ''}
                       />
+                      <label className="block text-sm font-medium text-slate-700">
+                        Attachment (optional document or picture)
+                        <input
+                          accept=".pdf,.doc,.docx,.txt,image/jpeg,image/png,image/webp"
+                          className="mt-1 block w-full text-sm text-slate-600"
+                          key={`${step.stepId}-attachment-${uploadVersion}`}
+                          onChange={(event) => setAttachments((current) => ({
+                            ...current,
+                            [step.stepId]: event.target.files?.[0] ?? null,
+                          }))}
+                          type="file"
+                        />
+                      </label>
                       <div className="flex flex-wrap gap-2">
                         <button
                           className="rounded bg-emerald-600 px-4 py-2 text-sm font-semibold text-white hover:bg-emerald-700 disabled:cursor-not-allowed disabled:bg-slate-400"
@@ -162,6 +209,10 @@ export function OfficeStaffDashboardPage() {
                         </button>
                       </div>
                     </form>
+                  ) : step.status === 'NEEDS_CORRECTION' ? (
+                    <p className="rounded bg-amber-50 px-3 py-2 text-sm text-amber-700">
+                      Waiting for student correction before this office can review again.
+                    </p>
                   ) : (
                     <p className="text-sm text-slate-500">
                       Reviewed {step.reviewedAt ? new Date(step.reviewedAt).toLocaleString() : 'recently'}

@@ -3,7 +3,9 @@ import { PageShell } from '../components/PageShell';
 import { RoleActivityPanel } from '../components/RoleActivityPanel';
 import {
   createClearanceRequest,
+  downloadAttachment,
   getMyClearanceRequests,
+  resubmitClearanceStep,
   type ClearanceRequestResponse,
   type ClearanceType,
 } from '../services/api';
@@ -12,8 +14,12 @@ export function StudentDashboardPage() {
   const [requestType, setRequestType] = useState<ClearanceType>('GRADUATION');
   const [reason, setReason] = useState('');
   const [requests, setRequests] = useState<ClearanceRequestResponse[]>([]);
+  const [correctionNotes, setCorrectionNotes] = useState<Record<number, string>>({});
+  const [correctionAttachments, setCorrectionAttachments] = useState<Record<number, File | null>>({});
+  const [uploadVersion, setUploadVersion] = useState(0);
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
+  const [resubmittingStepId, setResubmittingStepId] = useState<number | null>(null);
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
 
@@ -49,9 +55,32 @@ export function StudentDashboardPage() {
       setReason('');
       await loadRequests();
     } catch (requestError) {
-      setError(requestError instanceof Error ? requestError.message : 'Could not create request');
+      setError(formatStudentRequestError(requestError));
     } finally {
       setSubmitting(false);
+    }
+  }
+
+  async function handleResubmit(stepId: number) {
+    setMessage('');
+    setError('');
+    setResubmittingStepId(stepId);
+
+    try {
+      await resubmitClearanceStep(
+        stepId,
+        correctionNotes[stepId] ?? '',
+        correctionAttachments[stepId]
+      );
+      setMessage('Correction submitted. Waiting for office re-review.');
+      setCorrectionNotes((current) => ({ ...current, [stepId]: '' }));
+      setCorrectionAttachments((current) => ({ ...current, [stepId]: null }));
+      setUploadVersion((current) => current + 1);
+      await loadRequests();
+    } catch (resubmitError) {
+      setError(resubmitError instanceof Error ? resubmitError.message : 'Could not request re-review');
+    } finally {
+      setResubmittingStepId(null);
     }
   }
 
@@ -144,8 +173,64 @@ export function StudentDashboardPage() {
                     {request.steps.map((step) => (
                       <div key={step.id} className="rounded border border-slate-200 px-3 py-2">
                         <p className="text-sm font-medium text-slate-900">{step.officeName}</p>
-                        <p className="text-xs font-semibold text-slate-500">{step.status}</p>
+                        <p className="text-xs font-semibold text-slate-500">{formatEnum(step.status)}</p>
                         {step.comment && <p className="mt-1 text-xs text-slate-500">{step.comment}</p>}
+                        {(step.attachments ?? []).length > 0 && (
+                          <div className="mt-2 space-y-1">
+                            {(step.attachments ?? []).map((attachment) => (
+                              <button
+                                className="block text-left text-xs font-medium text-brand-700 hover:underline"
+                                key={attachment.id}
+                                onClick={() => void downloadAttachment(attachment).catch((downloadError) => {
+                                  setError(downloadError instanceof Error ? downloadError.message : 'Could not download attachment');
+                                })}
+                                type="button"
+                              >
+                                {formatEnum(attachment.purpose)}: {attachment.fileName}
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                        {canResubmitStep(step, request.status) && (
+                          <div className="mt-3 space-y-2">
+                            <p className="rounded bg-amber-50 px-2 py-1 text-xs text-amber-700">
+                              This office needs your correction. Submit a note to send it back to the same office for re-review.
+                            </p>
+                            <textarea
+                              className="min-h-20 w-full rounded border border-slate-300 px-3 py-2 text-sm"
+                              maxLength={500}
+                              onChange={(event) => setCorrectionNotes((current) => ({ ...current, [step.id]: event.target.value }))}
+                              placeholder={`Correction note for ${step.officeName}`}
+                              value={correctionNotes[step.id] ?? ''}
+                            />
+                            <label className="block text-xs font-medium text-slate-700">
+                              Attachment (optional document or picture)
+                              <input
+                                accept=".pdf,.doc,.docx,.txt,image/jpeg,image/png,image/webp"
+                                className="mt-1 block w-full text-xs text-slate-600"
+                                key={`${step.id}-attachment-${uploadVersion}`}
+                                onChange={(event) => setCorrectionAttachments((current) => ({
+                                  ...current,
+                                  [step.id]: event.target.files?.[0] ?? null,
+                                }))}
+                                type="file"
+                              />
+                            </label>
+                            <button
+                              className="rounded bg-brand-600 px-3 py-2 text-sm font-semibold text-white hover:bg-brand-700 disabled:cursor-not-allowed disabled:bg-slate-400"
+                              disabled={resubmittingStepId === step.id}
+                              onClick={() => void handleResubmit(step.id)}
+                              type="button"
+                            >
+                              {resubmittingStepId === step.id ? 'Submitting...' : 'Resubmit to office'}
+                            </button>
+                          </div>
+                        )}
+                        {step.status === 'RESUBMITTED' && (
+                          <p className="mt-2 rounded bg-blue-50 px-2 py-1 text-xs text-blue-700">
+                            Correction submitted. Waiting for office re-review.
+                          </p>
+                        )}
                       </div>
                     ))}
                   </div>
@@ -161,4 +246,22 @@ export function StudentDashboardPage() {
 
 function formatEnum(value: string) {
   return value.replace(/_/g, ' ');
+}
+
+function canResubmitStep(step: { officeName: string; status: string }, requestStatus: string) {
+  if (step.officeName.toLowerCase() === 'registrar') {
+    return false;
+  }
+  if (requestStatus === 'COMPLETED' || requestStatus === 'CANCELLED') {
+    return false;
+  }
+  return step.status === 'NEEDS_CORRECTION' || step.status === 'REJECTED';
+}
+
+function formatStudentRequestError(error: unknown) {
+  const message = error instanceof Error ? error.message : 'Could not create request';
+  if (message.toLowerCase().includes('student profile')) {
+    return `${message}. Ask an admin to recreate this account with student ID, department, program, and year of study.`;
+  }
+  return message;
 }

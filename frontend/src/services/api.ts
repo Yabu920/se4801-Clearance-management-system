@@ -63,6 +63,18 @@ export type ClearanceStepResponse = {
   status: string;
   comment?: string | null;
   reviewedAt?: string | null;
+  attachments: AttachmentResponse[];
+};
+
+export type AttachmentResponse = {
+  id: number;
+  fileName: string;
+  contentType: string;
+  attachmentKind: 'DOCUMENT' | 'IMAGE';
+  purpose: 'LEGACY' | 'STUDENT_CORRECTION' | 'OFFICE_REVIEW' | 'REGISTRAR_DECISION';
+  uploadedAt: string;
+  uploadedBy?: string | null;
+  downloadUrl: string;
 };
 
 export type StudentSummary = {
@@ -96,6 +108,7 @@ export type OfficeStepReviewResponse = {
   comment?: string | null;
   reviewedAt?: string | null;
   reviewedBy?: string | null;
+  attachments: AttachmentResponse[];
 };
 
 export type PageResponse<T> = {
@@ -105,6 +118,13 @@ export type PageResponse<T> = {
   totalElements: number;
   totalPages: number;
   last: boolean;
+};
+
+export type OfficeResponse = {
+  id: number;
+  officeName: string;
+  description?: string | null;
+  active: boolean;
 };
 
 export type AdminOverviewResponse = {
@@ -238,6 +258,10 @@ export async function getAdminOverview() {
   return authorizedJson<AdminOverviewResponse>('/api/admin/overview');
 }
 
+export async function getAdminOffices() {
+  return authorizedJson<OfficeResponse[]>('/api/admin/offices');
+}
+
 export async function createClearanceRequest(payload: ClearanceRequestPayload) {
   return authorizedJson<ClearanceRequestResponse>('/api/clearance-requests', {
     method: 'POST',
@@ -255,15 +279,33 @@ export async function getClearanceRequestById(id: number) {
   return authorizedJson<ClearanceRequestResponse>(`/api/clearance-requests/${id}`);
 }
 
+export async function resubmitClearanceStep(
+  stepId: number,
+  correctionNote: string,
+  attachment?: File | null
+) {
+  const formData = workflowFormData({ correctionNote }, attachment);
+  return authorizedMultipart<ClearanceRequestResponse>(`/api/clearance-requests/steps/${stepId}/resubmit`, {
+    method: 'PATCH',
+    body: formData,
+  });
+}
+
 export async function getAssignedOfficeSteps(status?: string) {
   const query = status ? `?status=${status}` : '';
   return authorizedJson<PageResponse<OfficeStepReviewResponse>>(`/api/office/clearance-steps${query}`);
 }
 
-export async function reviewOfficeStep(stepId: number, decision: 'APPROVED' | 'REJECTED', comment: string) {
-  return authorizedJson<OfficeStepReviewResponse>(`/api/office/clearance-steps/${stepId}/review`, {
+export async function reviewOfficeStep(
+  stepId: number,
+  decision: 'APPROVED' | 'REJECTED',
+  comment: string,
+  attachment?: File | null
+) {
+  const formData = workflowFormData({ decision, comment }, attachment);
+  return authorizedMultipart<OfficeStepReviewResponse>(`/api/office/clearance-steps/${stepId}/review`, {
     method: 'PATCH',
-    body: JSON.stringify({ decision, comment }),
+    body: formData,
   });
 }
 
@@ -306,12 +348,35 @@ export async function getRegistrarClearanceRequest(id: number) {
 export async function decideRegistrarClearance(
   id: number,
   decision: 'APPROVED' | 'REJECTED',
-  comment: string
+  comment: string,
+  attachment?: File | null
 ) {
-  return authorizedJson<ClearanceRequestResponse>(`/api/registrar/clearance-requests/${id}/decision`, {
+  const formData = workflowFormData({ decision, comment }, attachment);
+  return authorizedMultipart<ClearanceRequestResponse>(`/api/registrar/clearance-requests/${id}/decision`, {
     method: 'PATCH',
-    body: JSON.stringify({ decision, comment }),
+    body: formData,
   });
+}
+
+export async function downloadAttachment(attachment: AttachmentResponse) {
+  const token = getToken();
+  if (!token) {
+    throw new Error('Please login before downloading attachments.');
+  }
+
+  const response = await fetch(`${API_BASE_URL}${attachment.downloadUrl}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!response.ok) {
+    throw new Error(await resolveErrorMessage(response));
+  }
+
+  const objectUrl = URL.createObjectURL(await response.blob());
+  const link = window.document.createElement('a');
+  link.href = objectUrl;
+  link.download = attachment.fileName;
+  link.click();
+  URL.revokeObjectURL(objectUrl);
 }
 
 export function getToken() {
@@ -375,6 +440,41 @@ async function authorizedJson<T>(path: string, options: RequestInit = {}) {
   }
 
   return response.json() as Promise<T>;
+}
+
+async function authorizedMultipart<T>(path: string, options: RequestInit) {
+  const token = getToken();
+  if (!token) {
+    throw new Error('Please login before using clearance requests.');
+  }
+
+  let response: Response;
+  try {
+    response = await fetch(`${API_BASE_URL}${path}`, {
+      ...options,
+      headers: {
+        Authorization: `Bearer ${token}`,
+        ...options.headers,
+      },
+    });
+  } catch {
+    throw new Error(BACKEND_CONNECTION_ERROR);
+  }
+
+  if (!response.ok) {
+    throw new Error(await resolveErrorMessage(response));
+  }
+  return response.json() as Promise<T>;
+}
+
+function workflowFormData(
+  request: Record<string, unknown>,
+  attachment?: File | null
+) {
+  const formData = new FormData();
+  formData.append('request', new Blob([JSON.stringify(request)], { type: 'application/json' }));
+  if (attachment) formData.append('attachment', attachment);
+  return formData;
 }
 
 async function resolveErrorMessage(response: Response) {
